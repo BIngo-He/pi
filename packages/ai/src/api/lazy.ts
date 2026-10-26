@@ -1,7 +1,7 @@
 import type { Api, AssistantMessage, AssistantMessageEvent, Model, ProviderStreams } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 
-function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMessage {
+function createSetupErrorMessage(model: Model<Api>, error: unknown, timestamp: number): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -18,17 +18,38 @@ function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMe
 		},
 		stopReason: "error",
 		errorMessage: error instanceof Error ? error.message : String(error),
-		timestamp: Date.now(),
+		timestamp,
 	};
 }
 
-function forwardStream(target: AssistantMessageEventStream, source: AsyncIterable<AssistantMessageEvent>): void {
-	(async () => {
-		for await (const event of source) {
-			target.push(event);
-		}
-		target.end();
-	})();
+function hasResult(
+	source: AsyncIterable<AssistantMessageEvent>,
+): source is AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> } {
+	return typeof (source as { result?: unknown }).result === "function";
+}
+
+/** Synchronous, read-only observation of the stream's existing forwarding path. */
+export interface LazyStreamObserver {
+	onEvent?(event: AssistantMessageEvent): void;
+	onResult?(result: AssistantMessage | undefined): void;
+}
+
+async function forwardStream(
+	target: AssistantMessageEventStream,
+	source: AsyncIterable<AssistantMessageEvent>,
+	observer: LazyStreamObserver | undefined,
+	observeResult: (result: AssistantMessage | undefined) => void,
+): Promise<void> {
+	let result: AssistantMessage | undefined;
+	for await (const event of source) {
+		target.push(event);
+		observer?.onEvent?.(event);
+		if (event.type === "done") result = event.message;
+		else if (event.type === "error") result = event.error;
+	}
+	if (hasResult(source)) result = await source.result();
+	target.end(result);
+	observeResult(result);
 }
 
 /**
@@ -39,17 +60,26 @@ function forwardStream(target: AssistantMessageEventStream, source: AsyncIterabl
 export function lazyStream(
 	model: Model<Api>,
 	setup: () => Promise<AsyncIterable<AssistantMessageEvent>>,
+	observer?: LazyStreamObserver,
 ): AssistantMessageEventStream {
+	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
+	let observedResult = false;
+	const observeResult = (result: AssistantMessage | undefined): void => {
+		if (observedResult) return;
+		observedResult = true;
+		observer?.onResult?.(result);
+	};
 
 	setup()
-		.then((inner) => {
-			forwardStream(outer, inner);
-		})
+		.then((inner) => forwardStream(outer, inner, observer, observeResult))
 		.catch((error) => {
-			const message = createSetupErrorMessage(model, error);
-			outer.push({ type: "error", reason: "error", error: message });
+			const message = createSetupErrorMessage(model, error, startedAt);
+			const event: AssistantMessageEvent = { type: "error", reason: "error", error: message };
+			outer.push(event);
+			observer?.onEvent?.(event);
 			outer.end(message);
+			observeResult(message);
 		});
 
 	return outer;
@@ -60,11 +90,34 @@ export function lazyStream(
  * The module loads on first stream call; the host's import cache deduplicates
  * loads. Load failures terminate the returned stream with an error event.
  */
-export function lazyApi(load: () => Promise<ProviderStreams>): ProviderStreams {
-	return {
+export interface LazyApiCapabilities {
+	fetchDeferred?: boolean;
+	cancelDeferred?: boolean;
+}
+
+export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
+	const api: ProviderStreams = {
 		stream: (model, context, options) =>
 			lazyStream(model, async () => (await load()).stream(model, context, options)),
 		streamSimple: (model, context, options) =>
 			lazyStream(model, async () => (await load()).streamSimple(model, context, options)),
 	};
+
+	if (capabilities?.fetchDeferred) {
+		api.fetchDeferred = (model, handle, options) =>
+			lazyStream(model, async () => {
+				const implementation = await load();
+				if (!implementation.fetchDeferred) throw new Error("API does not support deferred responses");
+				return implementation.fetchDeferred(model, handle, options);
+			});
+	}
+	if (capabilities?.cancelDeferred) {
+		api.cancelDeferred = async (model, handle, options) => {
+			const implementation = await load();
+			if (!implementation.cancelDeferred) throw new Error("API cannot cancel deferred responses");
+			await implementation.cancelDeferred(model, handle, options);
+		};
+	}
+
+	return api;
 }
